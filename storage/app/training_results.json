@@ -1,0 +1,17 @@
+[
+    {
+        "id": "result_20260819_183431_f60577",
+        "pack_id": "job_20260813_162731_b25445",
+        "pack_name": "Test pack",
+        "pack_side": "front",
+        "created_at": "2026-08-19T18:34:31+02:00",
+        "accuracy": 0.7,
+        "precision": 0.7,
+        "recall": 0.7,
+        "false_positives": 11,
+        "false_negatives": 15,
+        "weak_clusters": [],
+        "notes": "",
+        "pack_size": 9
+    }
+]

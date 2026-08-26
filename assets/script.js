@@ -1,37 +1,77 @@
-document.addEventListener('DOMContentLoaded', () => {
-    const form = document.getElementById('loginForm');
-    const email = document.getElementById('email');
-    const password = document.getElementById('password');
-    const status = document.getElementById('formStatus');
+document.addEventListener('DOMContentLoaded', function () {
+    var filterForm = document.querySelector('.filters');
+    var sideFilter = document.getElementById('sideFilter');
+    var classificationFilter = document.getElementById('classificationFilter');
+    var preview = document.getElementById('imagePreview');
+    var previewImage = document.getElementById('lightboxImage');
+    var previewTitle = document.getElementById('lightboxTitle');
+    var previewClose = document.getElementById('lightboxClose');
 
-    if (!form || !email || !password || !status) {
-        return;
+    function submitFilterForm() {
+        if (!filterForm) {
+            return;
+        }
+
+        filterForm.submit();
     }
 
-    form.addEventListener('submit', (event) => {
-        status.textContent = '';
-
-        const emailValue = email.value.trim();
-        const passwordValue = password.value.trim();
-
-        if (!emailValue || !passwordValue) {
-            event.preventDefault();
-            status.textContent = 'Please enter both email and password.';
+    function openPreview(source, alt, meta) {
+        if (!preview || !previewImage || !previewTitle) {
             return;
         }
 
-        if (!/^\S+@\S+\.\S+$/.test(emailValue)) {
-            event.preventDefault();
-            status.textContent = 'Please enter a valid email address.';
+        previewImage.src = source;
+        previewImage.alt = alt || 'Cheque preview';
+        previewTitle.textContent = meta || alt || 'Cheque preview';
+        preview.hidden = false;
+        document.body.style.overflow = 'hidden';
+    }
+
+    function closePreview() {
+        if (!preview || !previewImage) {
             return;
         }
 
-        if (passwordValue.length < 6) {
-            event.preventDefault();
-            status.textContent = 'Password must be at least 6 characters.';
-            return;
-        }
+        preview.hidden = true;
+        previewImage.src = '';
+        document.body.style.overflow = '';
+    }
 
-        status.textContent = 'Signing in...';
+    if (sideFilter) {
+        sideFilter.addEventListener('change', submitFilterForm);
+    }
+
+    if (classificationFilter) {
+        classificationFilter.addEventListener('change', submitFilterForm);
+    }
+
+    document.querySelectorAll('[data-preview-src]').forEach(function (trigger) {
+        trigger.addEventListener('click', function () {
+            openPreview(
+                trigger.getAttribute('data-preview-src'),
+                trigger.getAttribute('data-preview-alt'),
+                trigger.getAttribute('data-preview-meta')
+            );
+        });
+    });
+
+    if (preview) {
+        preview.addEventListener('click', function (event) {
+            var target = event.target;
+
+            if (target && target.getAttribute('data-close-preview') === 'true') {
+                closePreview();
+            }
+        });
+    }
+
+    if (previewClose) {
+        previewClose.addEventListener('click', closePreview);
+    }
+
+    document.addEventListener('keydown', function (event) {
+        if (event.key === 'Escape') {
+            closePreview();
+        }
     });
 });
