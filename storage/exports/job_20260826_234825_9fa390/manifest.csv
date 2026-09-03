@@ -1,0 +1,7 @@
+source_path,target_path,split,class_name,side,classification,group
+storage/dummy_data/back/regular/group_3/back_regular_group_3_1.png,storage/exports/job_20260826_234825_9fa390/train/regular/back__group_3__back_regular_group_3_1.png,train,regular,back,regular,group_3
+storage/dummy_data/back/regular/group_2/back_regular_group_2_1.png,storage/exports/job_20260826_234825_9fa390/train/regular/back__group_2__back_regular_group_2_1.png,train,regular,back,regular,group_2
+storage/dummy_data/back/suspicious/group_3/back_suspicious_group_3_2.png,storage/exports/job_20260826_234825_9fa390/train/suspicious/back__group_3__back_suspicious_group_3_2.png,train,suspicious,back,suspicious,group_3
+storage/dummy_data/back/suspicious/group_1/back_suspicious_group_1_2.png,storage/exports/job_20260826_234825_9fa390/train/suspicious/back__group_1__back_suspicious_group_1_2.png,train,suspicious,back,suspicious,group_1
+storage/dummy_data/back/regular/group_1/back_regular_group_1_2.png,storage/exports/job_20260826_234825_9fa390/val/regular/back__group_1__back_regular_group_1_2.png,val,regular,back,regular,group_1
+storage/dummy_data/back/suspicious/group_2/back_suspicious_group_2_1.png,storage/exports/job_20260826_234825_9fa390/test/suspicious/back__group_2__back_suspicious_group_2_1.png,test,suspicious,back,suspicious,group_2

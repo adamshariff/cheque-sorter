@@ -1,0 +1,28 @@
+{
+    "job_id": "job_20260826_234825_9fa390",
+    "pack_name": "Test Pack 2",
+    "side": "back",
+    "pack_size": 6,
+    "created_at": "2026-08-26T23:48:25+02:00",
+    "split_counts": {
+        "train": 4,
+        "val": 1,
+        "test": 1
+    },
+    "classification_counts": {
+        "regular": 3,
+        "suspicious": 3
+    },
+    "grouped_samples_per_cluster": 1,
+    "train_ratio": 70,
+    "val_ratio": 15,
+    "test_ratio": 15,
+    "class_targets": {
+        "regular": 3,
+        "suspicious": 3
+    },
+    "manifest_relative_path": "storage/exports/job_20260826_234825_9fa390/manifest.csv",
+    "manifest_web_path": "storage/exports/job_20260826_234825_9fa390/manifest.csv",
+    "folder_relative_path": "storage/exports/job_20260826_234825_9fa390",
+    "folder_web_path": "storage/exports/job_20260826_234825_9fa390"
+}

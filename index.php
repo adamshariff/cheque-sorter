@@ -1,6 +1,7 @@
-<?php
+﻿<?php
 session_start();
 require __DIR__ . '/config.php';
+require __DIR__ . '/db.php';
 
 $requestPage = isset($_GET['page']) ? strtolower((string) $_GET['page']) : 'landing';
 
@@ -8,11 +9,10 @@ $projectRoot = $appConfig['project_root'] ?? __DIR__;
 $datasetRoot = $appConfig['dataset_root'] ?? ($projectRoot . DIRECTORY_SEPARATOR . 'storage' . DIRECTORY_SEPARATOR . 'dummy_data');
 $exportRoot = $appConfig['export_root'] ?? ($projectRoot . DIRECTORY_SEPARATOR . 'storage' . DIRECTORY_SEPARATOR . 'exports');
 $appStorageRoot = $appConfig['app_storage_root'] ?? ($projectRoot . DIRECTORY_SEPARATOR . 'storage' . DIRECTORY_SEPARATOR . 'app');
-$exportHistoryPath = $appStorageRoot . DIRECTORY_SEPARATOR . 'export_history.json';
-$resultHistoryPath = $appStorageRoot . DIRECTORY_SEPARATOR . 'training_results.json';
 $allowedSides = ['front', 'back'];
 $allowedClassifications = ['regular', 'suspicious'];
 $allowedImageExtensions = ['png', 'jpg', 'jpeg', 'bmp', 'gif', 'webp', 'tif', 'tiff'];
+$organizerPageSize = 100;
 
 $errors = [];
 $messages = [];
@@ -22,22 +22,14 @@ $recentResult = null;
 ensureDirectory($exportRoot, $errors, 'export storage');
 ensureDirectory($appStorageRoot, $errors, 'application storage');
 
-$dataset = scanDataset($datasetRoot, $allowedSides, $allowedClassifications, $allowedImageExtensions);
-$exportHistoryLoad = loadJsonFile($exportHistoryPath);
-$resultHistoryLoad = loadJsonFile($resultHistoryPath);
-$exportHistory = $exportHistoryLoad['data'];
-$trainingResults = $resultHistoryLoad['data'];
+$pdo = getDbConnection($appConfig);
+ensureSchema($pdo);
+bootstrapIndexIfNeeded($pdo, $datasetRoot, $allowedSides, $allowedClassifications, $allowedImageExtensions, $messages);
 
-if ($exportHistoryLoad['error'] !== null) {
-    $errors[] = $exportHistoryLoad['error'];
-}
-
-if ($resultHistoryLoad['error'] !== null) {
-    $errors[] = $resultHistoryLoad['error'];
-}
-
-$discoveredExports = discoverExports($exportRoot);
-$exportHistory = mergeExportHistory($discoveredExports, $exportHistory);
+$datasetStats = getDatasetStats($pdo, $allowedSides, $allowedClassifications);
+$clusterSummary = getClusterSummary($pdo);
+$exportHistory = getExportPacks($pdo);
+$trainingResults = getTrainingResults($pdo);
 $availablePackMap = indexBy($exportHistory, 'job_id');
 
 $organizerSide = isset($_GET['organizer_side']) ? strtolower((string) $_GET['organizer_side']) : $allowedSides[0];
@@ -50,30 +42,14 @@ if (!in_array($organizerClassification, $allowedClassifications, true)) {
     $organizerClassification = $allowedClassifications[0];
 }
 
-$organizerClusterChoices = [];
-foreach ($dataset['clusters'] as $cluster) {
-    if ($cluster['side'] !== $organizerSide || $cluster['classification'] !== $organizerClassification) {
-        continue;
-    }
-
-    $organizerClusterChoices[] = $cluster['cluster'];
-}
-sort($organizerClusterChoices, SORT_NATURAL | SORT_FLAG_CASE);
+$organizerClusterChoices = clusterChoicesFor($clusterSummary, $organizerSide, $organizerClassification);
 
 $organizerCluster = isset($_GET['organizer_cluster']) ? strtolower((string) $_GET['organizer_cluster']) : '';
 if (!in_array($organizerCluster, $organizerClusterChoices, true)) {
     $organizerCluster = !empty($organizerClusterChoices) ? $organizerClusterChoices[0] : '';
 }
 
-$organizerSelectedCard = null;
-if ($organizerCluster !== '') {
-    foreach ($dataset['clusters'] as $cluster) {
-        if ($cluster['side'] === $organizerSide && $cluster['classification'] === $organizerClassification && $cluster['cluster'] === $organizerCluster) {
-            $organizerSelectedCard = $cluster;
-            break;
-        }
-    }
-}
+$organizerPage = isset($_GET['organizer_page']) ? max(1, (int) $_GET['organizer_page']) : 1;
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $action = isset($_POST['action']) ? (string) $_POST['action'] : '';
@@ -92,17 +68,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $messages = array_merge($messages, $uploadResult['messages']);
 
         if (!empty($uploadResult['uploaded'])) {
-            $dataset = scanDataset($datasetRoot, $allowedSides, $allowedClassifications, $allowedImageExtensions);
+            reindexClusterFolder($pdo, $datasetRoot, $uploadResult['side'], $uploadResult['classification'], $uploadResult['cluster'], $allowedImageExtensions);
+            $datasetStats = getDatasetStats($pdo, $allowedSides, $allowedClassifications);
+            $clusterSummary = getClusterSummary($pdo);
+            $organizerClusterChoices = clusterChoicesFor($clusterSummary, $organizerSide, $organizerClassification);
         }
+    } elseif ($action === 'rescan-dataset') {
+        $rescanResult = reindexDataset($pdo, $datasetRoot, $allowedSides, $allowedClassifications, $allowedImageExtensions);
+        $messages[] = 'Dataset rescanned: ' . $rescanResult['scanned'] . ' image(s) indexed, ' . $rescanResult['removed'] . ' stale record(s) removed.';
+        $datasetStats = getDatasetStats($pdo, $allowedSides, $allowedClassifications);
+        $clusterSummary = getClusterSummary($pdo);
+        $organizerClusterChoices = clusterChoicesFor($clusterSummary, $organizerSide, $organizerClassification);
     } elseif ($action === 'create-pack') {
         $packResult = handlePackCreation(
+            $pdo,
             $_POST,
-            $dataset,
+            $datasetRoot,
             $exportRoot,
             $allowedSides,
-            $allowedClassifications,
-            $exportHistory,
-            $exportHistoryPath
+            $allowedClassifications
         );
 
         $errors = array_merge($errors, $packResult['errors']);
@@ -110,15 +94,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         if ($packResult['pack'] !== null) {
             $recentExport = $packResult['pack'];
-            $exportHistory = mergeExportHistory(discoverExports($exportRoot), $exportHistory);
+            $exportHistory = getExportPacks($pdo);
             $availablePackMap = indexBy($exportHistory, 'job_id');
         }
     } elseif ($action === 'save-result') {
         $resultSave = handleResultSave(
+            $pdo,
             $_POST,
-            $availablePackMap,
-            $trainingResults,
-            $resultHistoryPath
+            $availablePackMap
         );
 
         $errors = array_merge($errors, $resultSave['errors']);
@@ -126,20 +109,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         if ($resultSave['result'] !== null) {
             $recentResult = $resultSave['result'];
-            $trainingResults = $resultSave['results'];
+            $trainingResults = getTrainingResults($pdo);
         }
     }
 }
 
-$organizerClusterChoices = [];
-foreach ($dataset['clusters'] as $cluster) {
-    if ($cluster['side'] !== $organizerSide || $cluster['classification'] !== $organizerClassification) {
-        continue;
-    }
-
-    $organizerClusterChoices[] = $cluster['cluster'];
-}
-sort($organizerClusterChoices, SORT_NATURAL | SORT_FLAG_CASE);
+$organizerClusterChoices = clusterChoicesFor($clusterSummary, $organizerSide, $organizerClassification);
 
 if (!in_array($organizerCluster, $organizerClusterChoices, true)) {
     $organizerCluster = !empty($organizerClusterChoices) ? $organizerClusterChoices[0] : '';
@@ -147,12 +122,7 @@ if (!in_array($organizerCluster, $organizerClusterChoices, true)) {
 
 $organizerSelectedCard = null;
 if ($organizerCluster !== '') {
-    foreach ($dataset['clusters'] as $cluster) {
-        if ($cluster['side'] === $organizerSide && $cluster['classification'] === $organizerClassification && $cluster['cluster'] === $organizerCluster) {
-            $organizerSelectedCard = $cluster;
-            break;
-        }
-    }
+    $organizerSelectedCard = getOrganizerCluster($pdo, $datasetRoot, $organizerSide, $organizerClassification, $organizerCluster, $organizerPage, $organizerPageSize);
 }
 
 $exportSideValue = stickyPostValue('export_side', $allowedSides[0]);
@@ -160,7 +130,7 @@ if (!in_array($exportSideValue, $allowedSides, true)) {
     $exportSideValue = $allowedSides[0];
 }
 
-$recommendation = buildRecommendation($dataset, $exportHistory, $trainingResults, $allowedClassifications, $exportSideValue);
+$recommendation = buildRecommendation($pdo, $allowedClassifications, $exportSideValue);
 $selectedPackId = isset($_POST['result_pack_id']) ? (string) $_POST['result_pack_id'] : '';
 $groupedSamplesPerClusterValue = stickyPostValue('grouped_samples_per_cluster', (string) $recommendation['grouped_samples_per_cluster']);
 $packSizeValue = stickyPostValue('pack_size', (string) $recommendation['pack_size']);
@@ -229,18 +199,24 @@ $resultNotesValue = stickyPostValue('notes', '');
                 </p>
             </div>
 
+            <form method="post" class="stack-form" style="margin-bottom: 1rem;">
+                <input type="hidden" name="action" value="rescan-dataset">
+                <button type="submit" class="button">Rescan dataset</button>
+                <p class="help-text">Run after adding files outside the app (e.g. copying folders directly onto disk).</p>
+            </form>
+
             <div class="stat-grid">
                 <article class="stat-card">
                     <span class="stat-card__label">Total images</span>
-                    <strong class="stat-card__value"><?= htmlspecialchars((string) $dataset['stats']['total_images'], ENT_QUOTES, 'UTF-8') ?></strong>
+                    <strong class="stat-card__value"><?= htmlspecialchars((string) $datasetStats['total_images'], ENT_QUOTES, 'UTF-8') ?></strong>
                 </article>
                 <article class="stat-card">
                     <span class="stat-card__label">Grouped images</span>
-                    <strong class="stat-card__value"><?= htmlspecialchars((string) $dataset['stats']['grouped_images'], ENT_QUOTES, 'UTF-8') ?></strong>
+                    <strong class="stat-card__value"><?= htmlspecialchars((string) $datasetStats['grouped_images'], ENT_QUOTES, 'UTF-8') ?></strong>
                 </article>
                 <article class="stat-card">
                     <span class="stat-card__label">Ungroupable images</span>
-                    <strong class="stat-card__value"><?= htmlspecialchars((string) $dataset['stats']['ungroupable_images'], ENT_QUOTES, 'UTF-8') ?></strong>
+                    <strong class="stat-card__value"><?= htmlspecialchars((string) $datasetStats['ungroupable_images'], ENT_QUOTES, 'UTF-8') ?></strong>
                 </article>
                 <article class="stat-card">
                     <span class="stat-card__label">Saved export packs</span>
@@ -256,7 +232,7 @@ $resultNotesValue = stickyPostValue('notes', '');
                             <?php foreach ($allowedClassifications as $classification) : ?>
                                 <li>
                                     <span><?= htmlspecialchars(ucfirst($classification), ENT_QUOTES, 'UTF-8') ?></span>
-                                    <strong><?= htmlspecialchars((string) ($dataset['stats']['by_side'][$side][$classification] ?? 0), ENT_QUOTES, 'UTF-8') ?></strong>
+                                    <strong><?= htmlspecialchars((string) ($datasetStats['by_side'][$side][$classification] ?? 0), ENT_QUOTES, 'UTF-8') ?></strong>
                                 </li>
                             <?php endforeach; ?>
                         </ul>
@@ -269,7 +245,7 @@ $resultNotesValue = stickyPostValue('notes', '');
                             <?php foreach ($allowedSides as $side) : ?>
                                 <li>
                                     <span><?= htmlspecialchars(ucfirst($side), ENT_QUOTES, 'UTF-8') ?></span>
-                                    <strong><?= htmlspecialchars((string) ($dataset['stats']['by_classification'][$classification][$side] ?? 0), ENT_QUOTES, 'UTF-8') ?></strong>
+                                    <strong><?= htmlspecialchars((string) ($datasetStats['by_classification'][$classification][$side] ?? 0), ENT_QUOTES, 'UTF-8') ?></strong>
                                 </li>
                             <?php endforeach; ?>
                         </ul>
@@ -389,6 +365,16 @@ $resultNotesValue = stickyPostValue('notes', '');
                                 </button>
                             <?php endforeach; ?>
                         </div>
+                        <?php if ($organizerSelectedCard['total_pages'] > 1) : ?>
+                            <nav class="pagination" aria-label="Cluster image pages">
+                                <?php for ($pageNumber = 1; $pageNumber <= $organizerSelectedCard['total_pages']; $pageNumber++) : ?>
+                                    <a
+                                        class="<?= $pageNumber === $organizerSelectedCard['page'] ? 'is-active' : '' ?>"
+                                        href="organizer.php?organizer_side=<?= urlencode($organizerSide) ?>&organizer_classification=<?= urlencode($organizerClassification) ?>&organizer_cluster=<?= urlencode($organizerCluster) ?>&organizer_page=<?= $pageNumber ?>"
+                                    ><?= $pageNumber ?></a>
+                                <?php endfor; ?>
+                            </nav>
+                        <?php endif; ?>
                     </article>
                 <?php endif; ?>
             </div>
@@ -717,9 +703,8 @@ function saveJsonFile($path, $payload, array &$errors, $label)
     return true;
 }
 
-function scanDataset($datasetRoot, array $allowedSides, array $allowedClassifications, array $allowedExtensions)
+function getDatasetStats(PDO $pdo, array $allowedSides, array $allowedClassifications)
 {
-    $clusters = [];
     $stats = [
         'total_images' => 0,
         'grouped_images' => 0,
@@ -744,137 +729,244 @@ function scanDataset($datasetRoot, array $allowedSides, array $allowedClassifica
         }
     }
 
-    foreach ($allowedSides as $side) {
-        foreach ($allowedClassifications as $classification) {
-            $baseDirectory = $datasetRoot . DIRECTORY_SEPARATOR . $side . DIRECTORY_SEPARATOR . $classification;
+    $stmt = $pdo->query('SELECT side, classification, cluster, COUNT(*) AS image_count FROM images GROUP BY side, classification, cluster');
 
-            if (!is_dir($baseDirectory)) {
-                continue;
-            }
+    foreach ($stmt as $row) {
+        $side = $row['side'];
+        $classification = $row['classification'];
+        $count = (int) $row['image_count'];
 
-            $clusterNames = [];
-            $entries = scandir($baseDirectory);
+        $stats['total_images'] += $count;
 
-            if (!is_array($entries)) {
-                continue;
-            }
+        if (isset($stats['by_side'][$side][$classification])) {
+            $stats['by_side'][$side][$classification] += $count;
+        }
 
-            foreach ($entries as $entry) {
-                if ($entry === '.' || $entry === '..') {
-                    continue;
-                }
+        if (isset($stats['by_classification'][$classification][$side])) {
+            $stats['by_classification'][$classification][$side] += $count;
+        }
 
-                $clusterDirectory = $baseDirectory . DIRECTORY_SEPARATOR . $entry;
-
-                if (!is_dir($clusterDirectory)) {
-                    continue;
-                }
-
-                $clusterNames[] = $entry;
-            }
-
-            natcasesort($clusterNames);
-
-            foreach ($clusterNames as $clusterName) {
-                $clusterDirectory = $baseDirectory . DIRECTORY_SEPARATOR . $clusterName;
-                $images = listImages($clusterDirectory, $allowedExtensions);
-                $count = count($images);
-
-                if ($count === 0) {
-                    continue;
-                }
-
-                $clusters[] = [
-                    'key' => $side . '/' . $classification . '/' . $clusterName,
-                    'side' => $side,
-                    'classification' => $classification,
-                    'cluster' => $clusterName,
-                    'count' => $count,
-                    'relative_directory' => relativeProjectPath($clusterDirectory),
-                    'images' => $images,
-                ];
-
-                $stats['total_images'] += $count;
-                $stats['by_side'][$side][$classification] += $count;
-                $stats['by_classification'][$classification][$side] += $count;
-
-                if ($clusterName === 'ungroupable') {
-                    $stats['ungroupable_images'] += $count;
-                } else {
-                    $stats['grouped_images'] += $count;
-                }
-            }
+        if ($row['cluster'] === 'ungroupable') {
+            $stats['ungroupable_images'] += $count;
+        } else {
+            $stats['grouped_images'] += $count;
         }
     }
 
-    usort($clusters, function ($left, $right) {
-        return strcmp($left['key'], $right['key']);
-    });
-
-    return [
-        'clusters' => $clusters,
-        'stats' => $stats,
-    ];
+    return $stats;
 }
 
-function listImages($directory, array $allowedExtensions)
+/**
+ * Cheap cluster summary (side, classification, cluster, count) used for the
+ * organizer dropdown and pool sizing. Never loads individual image rows.
+ */
+function getClusterSummary(PDO $pdo)
 {
-    $records = [];
-    $entries = scandir($directory);
+    $stmt = $pdo->query('SELECT side, classification, cluster, COUNT(*) AS image_count FROM images GROUP BY side, classification, cluster ORDER BY side, classification, cluster');
+    $summary = [];
 
-    if (!is_array($entries)) {
-        return $records;
-    }
-
-    natcasesort($entries);
-
-    foreach ($entries as $entry) {
-        if ($entry === '.' || $entry === '..') {
-            continue;
-        }
-
-        $path = $directory . DIRECTORY_SEPARATOR . $entry;
-
-        if (!is_file($path)) {
-            continue;
-        }
-
-        $extension = strtolower((string) pathinfo($entry, PATHINFO_EXTENSION));
-
-        if (!in_array($extension, $allowedExtensions, true)) {
-            continue;
-        }
-
-        $relativePath = relativeProjectPath($path);
-        $records[] = [
-            'filename' => $entry,
-            'absolute_path' => $path,
-            'relative_path' => $relativePath,
-            'web_path' => toWebPath($relativePath),
-            'size_bytes' => (int) filesize($path),
-            'modified_at' => (int) filemtime($path),
+    foreach ($stmt as $row) {
+        $summary[] = [
+            'key' => $row['side'] . '/' . $row['classification'] . '/' . $row['cluster'],
+            'side' => $row['side'],
+            'classification' => $row['classification'],
+            'cluster' => $row['cluster'],
+            'count' => (int) $row['image_count'],
         ];
     }
 
-    return $records;
+    return $summary;
 }
 
-function discoverExports($exportRoot)
+function clusterChoicesFor(array $clusterSummary, $side, $classification)
 {
-    $exports = [];
+    $choices = [];
 
+    foreach ($clusterSummary as $cluster) {
+        if ($cluster['side'] !== $side || $cluster['classification'] !== $classification) {
+            continue;
+        }
+
+        $choices[] = $cluster['cluster'];
+    }
+
+    sort($choices, SORT_NATURAL | SORT_FLAG_CASE);
+
+    return $choices;
+}
+
+/**
+ * Loads a single page of images for one side/classification/cluster bucket.
+ * Only this one bucket is ever fully loaded into PHP, keeping organizer page
+ * loads fast regardless of overall dataset size.
+ */
+function getOrganizerCluster(PDO $pdo, $datasetRoot, $side, $classification, $cluster, $page, $pageSize)
+{
+    $countStmt = $pdo->prepare('SELECT COUNT(*) FROM images WHERE side = :side AND classification = :classification AND cluster = :cluster');
+    $countStmt->execute(['side' => $side, 'classification' => $classification, 'cluster' => $cluster]);
+    $total = (int) $countStmt->fetchColumn();
+
+    if ($total === 0) {
+        return null;
+    }
+
+    $totalPages = max(1, (int) ceil($total / $pageSize));
+    $page = min(max(1, $page), $totalPages);
+    $offset = ($page - 1) * $pageSize;
+
+    $stmt = $pdo->prepare(
+        'SELECT filename, relative_path FROM images '
+        . 'WHERE side = :side AND classification = :classification AND cluster = :cluster '
+        . 'ORDER BY filename ASC LIMIT :limit OFFSET :offset'
+    );
+    $stmt->bindValue('side', $side);
+    $stmt->bindValue('classification', $classification);
+    $stmt->bindValue('cluster', $cluster);
+    $stmt->bindValue('limit', $pageSize, PDO::PARAM_INT);
+    $stmt->bindValue('offset', $offset, PDO::PARAM_INT);
+    $stmt->execute();
+
+    $images = [];
+    foreach ($stmt as $row) {
+        $images[] = [
+            'filename' => $row['filename'],
+            'relative_path' => datasetRelativeWebPath($datasetRoot, $row['relative_path']),
+            'web_path' => toWebPath(datasetRelativeWebPath($datasetRoot, $row['relative_path'])),
+        ];
+    }
+
+    $clusterDirectory = $datasetRoot . DIRECTORY_SEPARATOR . $side . DIRECTORY_SEPARATOR . $classification . DIRECTORY_SEPARATOR . $cluster;
+
+    return [
+        'key' => $side . '/' . $classification . '/' . $cluster,
+        'side' => $side,
+        'classification' => $classification,
+        'cluster' => $cluster,
+        'count' => $total,
+        'relative_directory' => relativeProjectPath($clusterDirectory),
+        'images' => $images,
+        'page' => $page,
+        'total_pages' => $totalPages,
+    ];
+}
+
+/**
+ * Builds the web-servable path for an image given its path relative to the
+ * dataset root (side/classification/cluster/filename form stored in the DB).
+ */
+function datasetRelativeWebPath($datasetRoot, $relativePathFromDatasetRoot)
+{
+    $projectRelativeDatasetRoot = relativeProjectPath($datasetRoot);
+
+    if ($projectRelativeDatasetRoot === '') {
+        return $relativePathFromDatasetRoot;
+    }
+
+    return rtrim($projectRelativeDatasetRoot, '/') . '/' . $relativePathFromDatasetRoot;
+}
+
+function indexBy(array $records, $key)
+{
+    $indexed = [];
+
+    foreach ($records as $record) {
+        if (isset($record[$key])) {
+            $indexed[$record[$key]] = $record;
+        }
+    }
+
+    return $indexed;
+}
+
+function getExportPacks(PDO $pdo)
+{
+    $stmt = $pdo->query('SELECT * FROM export_packs ORDER BY created_at DESC');
+    $packs = [];
+
+    foreach ($stmt as $row) {
+        $packs[] = mapExportPackRow($row);
+    }
+
+    return $packs;
+}
+
+function mapExportPackRow(array $row)
+{
+    $manifestRelativePath = (string) $row['manifest_relative_path'];
+    $folderRelativePath = (string) $row['folder_relative_path'];
+
+    return [
+        'job_id' => $row['job_id'],
+        'pack_name' => $row['pack_name'],
+        'side' => $row['side'],
+        'pack_size' => (int) $row['pack_size'],
+        'created_at' => $row['created_at'],
+        'grouped_samples_per_cluster' => (int) $row['grouped_samples_per_cluster'],
+        'split_counts' => [
+            'train' => (int) $row['train_count'],
+            'val' => (int) $row['val_count'],
+            'test' => (int) $row['test_count'],
+        ],
+        'classification_counts' => [
+            'regular' => (int) $row['regular_count'],
+            'suspicious' => (int) $row['suspicious_count'],
+        ],
+        'class_targets' => json_decode((string) $row['class_targets_json'], true) ?: [],
+        'manifest_relative_path' => $manifestRelativePath,
+        'manifest_web_path' => toWebPath($manifestRelativePath),
+        'folder_relative_path' => $folderRelativePath,
+        'folder_web_path' => toWebPath($folderRelativePath),
+    ];
+}
+
+function getTrainingResults(PDO $pdo)
+{
+    $stmt = $pdo->query('SELECT * FROM training_results ORDER BY created_at DESC');
+    $results = [];
+
+    foreach ($stmt as $row) {
+        $results[] = [
+            'id' => $row['id'],
+            'pack_id' => $row['pack_id'],
+            'pack_name' => $row['pack_name'],
+            'pack_side' => $row['pack_side'],
+            'created_at' => $row['created_at'],
+            'accuracy' => (float) $row['accuracy'],
+            'precision' => (float) $row['precision_value'],
+            'recall' => (float) $row['recall_value'],
+            'false_positives' => (int) $row['false_positives'],
+            'false_negatives' => (int) $row['false_negatives'],
+            'notes' => $row['notes'],
+            'pack_size' => (int) $row['pack_size'],
+        ];
+    }
+
+    return $results;
+}
+
+/**
+ * Reconciles the export_packs table against manifest folders found on disk.
+ * On-demand only (not run on every page load) since filesystem discovery was
+ * one of the original performance offenders.
+ */
+function reconcileExports(PDO $pdo, $exportRoot)
+{
     if (!is_dir($exportRoot)) {
-        return $exports;
+        return 0;
     }
 
     $entries = scandir($exportRoot);
 
     if (!is_array($entries)) {
-        return $exports;
+        return 0;
     }
 
+    $existingStmt = $pdo->query('SELECT job_id FROM export_packs');
+    $existingJobIds = array_flip($existingStmt->fetchAll(PDO::FETCH_COLUMN));
+    $imported = 0;
+
     foreach ($entries as $entry) {
-        if ($entry === '.' || $entry === '..') {
+        if ($entry === '.' || $entry === '..' || isset($existingJobIds[$entry])) {
             continue;
         }
 
@@ -885,43 +977,41 @@ function discoverExports($exportRoot)
         }
 
         $packPath = $jobDirectory . DIRECTORY_SEPARATOR . 'pack.json';
+        $manifestPath = $jobDirectory . DIRECTORY_SEPARATOR . 'manifest.csv';
+        $pack = null;
 
         if (is_file($packPath)) {
-            $payload = loadJsonFile($packPath);
+            $decoded = json_decode((string) file_get_contents($packPath), true);
 
-            if ($payload['error'] === null && !empty($payload['data'])) {
-                $exports[] = normalizeExportHistoryItem($payload['data']);
-                continue;
+            if (is_array($decoded)) {
+                $pack = $decoded;
             }
         }
 
-        $manifestPath = $jobDirectory . DIRECTORY_SEPARATOR . 'manifest.csv';
+        if ($pack === null && is_file($manifestPath)) {
+            $parsed = parseManifestCounts($manifestPath);
+            $pack = [
+                'job_id' => $entry,
+                'pack_name' => $entry,
+                'side' => $parsed['side'],
+                'pack_size' => $parsed['pack_size'],
+                'created_at' => date(DATE_ATOM, (int) filemtime($manifestPath)),
+                'split_counts' => $parsed['split_counts'],
+                'classification_counts' => $parsed['classification_counts'],
+                'manifest_relative_path' => relativeProjectPath($manifestPath),
+                'folder_relative_path' => relativeProjectPath($jobDirectory),
+            ];
+        }
 
-        if (!is_file($manifestPath)) {
+        if ($pack === null) {
             continue;
         }
 
-        $parsed = parseManifestCounts($manifestPath);
-        $exports[] = [
-            'job_id' => $entry,
-            'pack_name' => $entry,
-            'side' => $parsed['side'],
-            'pack_size' => $parsed['pack_size'],
-            'created_at' => date(DATE_ATOM, (int) filemtime($manifestPath)),
-            'split_counts' => $parsed['split_counts'],
-            'classification_counts' => $parsed['classification_counts'],
-            'manifest_relative_path' => relativeProjectPath($manifestPath),
-            'manifest_web_path' => toWebPath(relativeProjectPath($manifestPath)),
-            'folder_relative_path' => relativeProjectPath($jobDirectory),
-            'folder_web_path' => toWebPath(relativeProjectPath($jobDirectory)),
-        ];
+        insertExportPack($pdo, $pack);
+        $imported++;
     }
 
-    usort($exports, function ($left, $right) {
-        return strcmp($right['created_at'], $left['created_at']);
-    });
-
-    return $exports;
+    return $imported;
 }
 
 function parseManifestCounts($manifestPath)
@@ -976,53 +1066,52 @@ function parseManifestCounts($manifestPath)
     ];
 }
 
-function normalizeExportHistoryItem(array $item)
+function insertExportPack(PDO $pdo, array $pack)
 {
-    $item['side'] = isset($item['side']) && in_array($item['side'], ['front', 'back'], true) ? $item['side'] : 'mixed';
-    $item['split_counts'] = isset($item['split_counts']) && is_array($item['split_counts']) ? $item['split_counts'] : ['train' => 0, 'val' => 0, 'test' => 0];
-    $item['classification_counts'] = isset($item['classification_counts']) && is_array($item['classification_counts']) ? $item['classification_counts'] : ['regular' => 0, 'suspicious' => 0];
-    $item['manifest_relative_path'] = isset($item['manifest_relative_path']) ? $item['manifest_relative_path'] : '';
-    $item['folder_relative_path'] = isset($item['folder_relative_path']) ? $item['folder_relative_path'] : '';
-    $item['manifest_web_path'] = isset($item['manifest_web_path']) && $item['manifest_web_path'] !== '' ? $item['manifest_web_path'] : toWebPath($item['manifest_relative_path']);
-    $item['folder_web_path'] = isset($item['folder_web_path']) && $item['folder_web_path'] !== '' ? $item['folder_web_path'] : toWebPath($item['folder_relative_path']);
-    return $item;
-}
+    $splitCounts = is_array($pack['split_counts'] ?? null) ? $pack['split_counts'] : ['train' => 0, 'val' => 0, 'test' => 0];
+    $classificationCounts = is_array($pack['classification_counts'] ?? null) ? $pack['classification_counts'] : ['regular' => 0, 'suspicious' => 0];
+    $side = in_array($pack['side'] ?? null, ['front', 'back'], true) ? $pack['side'] : 'mixed';
+    $createdAt = isset($pack['created_at']) ? date('Y-m-d H:i:s', strtotime((string) $pack['created_at']) ?: time()) : date('Y-m-d H:i:s');
 
-function mergeExportHistory(array $discoveredExports, array $storedHistory)
-{
-    $merged = [];
+    $stmt = $pdo->prepare(
+        'INSERT INTO export_packs ('
+        . 'job_id, pack_name, side, pack_size, grouped_samples_per_cluster, '
+        . 'train_ratio, val_ratio, test_ratio, train_count, val_count, test_count, '
+        . 'regular_count, suspicious_count, class_targets_json, manifest_relative_path, '
+        . 'folder_relative_path, created_at'
+        . ') VALUES ('
+        . ':job_id, :pack_name, :side, :pack_size, :grouped_samples_per_cluster, '
+        . ':train_ratio, :val_ratio, :test_ratio, :train_count, :val_count, :test_count, '
+        . ':regular_count, :suspicious_count, :class_targets_json, :manifest_relative_path, '
+        . ':folder_relative_path, :created_at'
+        . ') ON DUPLICATE KEY UPDATE '
+        . 'pack_name = VALUES(pack_name), side = VALUES(side), pack_size = VALUES(pack_size), '
+        . 'grouped_samples_per_cluster = VALUES(grouped_samples_per_cluster), '
+        . 'train_count = VALUES(train_count), val_count = VALUES(val_count), test_count = VALUES(test_count), '
+        . 'regular_count = VALUES(regular_count), suspicious_count = VALUES(suspicious_count), '
+        . 'class_targets_json = VALUES(class_targets_json), '
+        . 'manifest_relative_path = VALUES(manifest_relative_path), folder_relative_path = VALUES(folder_relative_path)'
+    );
 
-    foreach ($discoveredExports as $export) {
-        $merged[$export['job_id']] = normalizeExportHistoryItem($export);
-    }
-
-    foreach ($storedHistory as $export) {
-        if (!is_array($export) || !isset($export['job_id'])) {
-            continue;
-        }
-
-        $merged[$export['job_id']] = normalizeExportHistoryItem(array_merge($merged[$export['job_id']] ?? [], $export));
-    }
-
-    $merged = array_values($merged);
-    usort($merged, function ($left, $right) {
-        return strcmp($right['created_at'], $left['created_at']);
-    });
-
-    return $merged;
-}
-
-function indexBy(array $records, $key)
-{
-    $indexed = [];
-
-    foreach ($records as $record) {
-        if (isset($record[$key])) {
-            $indexed[$record[$key]] = $record;
-        }
-    }
-
-    return $indexed;
+    $stmt->execute([
+        'job_id' => $pack['job_id'],
+        'pack_name' => $pack['pack_name'] ?? $pack['job_id'],
+        'side' => $side,
+        'pack_size' => (int) ($pack['pack_size'] ?? 0),
+        'grouped_samples_per_cluster' => (int) ($pack['grouped_samples_per_cluster'] ?? 0),
+        'train_ratio' => (int) ($pack['train_ratio'] ?? 0),
+        'val_ratio' => (int) ($pack['val_ratio'] ?? 0),
+        'test_ratio' => (int) ($pack['test_ratio'] ?? 0),
+        'train_count' => (int) ($splitCounts['train'] ?? 0),
+        'val_count' => (int) ($splitCounts['val'] ?? 0),
+        'test_count' => (int) ($splitCounts['test'] ?? 0),
+        'regular_count' => (int) ($classificationCounts['regular'] ?? 0),
+        'suspicious_count' => (int) ($classificationCounts['suspicious'] ?? 0),
+        'class_targets_json' => json_encode($pack['class_targets'] ?? new stdClass()),
+        'manifest_relative_path' => $pack['manifest_relative_path'] ?? '',
+        'folder_relative_path' => $pack['folder_relative_path'] ?? '',
+        'created_at' => $createdAt,
+    ]);
 }
 
 function handleUploadRequest(array $post, array $files, $datasetRoot, array $allowedSides, array $allowedClassifications, array $allowedExtensions)
@@ -1055,14 +1144,14 @@ function handleUploadRequest(array $post, array $files, $datasetRoot, array $all
     }
 
     if (!empty($errors)) {
-        return ['errors' => $errors, 'messages' => $messages, 'uploaded' => $uploaded];
+        return ['errors' => $errors, 'messages' => $messages, 'uploaded' => $uploaded, 'side' => $side, 'classification' => $classification, 'cluster' => $cluster];
     }
 
     $targetDirectory = $datasetRoot . DIRECTORY_SEPARATOR . $side . DIRECTORY_SEPARATOR . $classification . DIRECTORY_SEPARATOR . $cluster;
 
     if (!is_dir($targetDirectory) && !@mkdir($targetDirectory, 0777, true)) {
         $errors[] = 'Unable to create the target cluster directory at ' . relativeProjectPath($targetDirectory) . '.';
-        return ['errors' => $errors, 'messages' => $messages, 'uploaded' => $uploaded];
+        return ['errors' => $errors, 'messages' => $messages, 'uploaded' => $uploaded, 'side' => $side, 'classification' => $classification, 'cluster' => $cluster];
     }
 
     foreach ($uploads as $upload) {
@@ -1099,7 +1188,7 @@ function handleUploadRequest(array $post, array $files, $datasetRoot, array $all
         $messages[] = 'Added ' . count($uploaded) . ' image(s) to ' . $side . '/' . $classification . '/' . $cluster . '.';
     }
 
-    return ['errors' => $errors, 'messages' => $messages, 'uploaded' => $uploaded];
+    return ['errors' => $errors, 'messages' => $messages, 'uploaded' => $uploaded, 'side' => $side, 'classification' => $classification, 'cluster' => $cluster];
 }
 
 function normalizeUploads($fileField)
@@ -1176,7 +1265,7 @@ function buildUniqueFileName($directory, $baseName, $extension)
     return $candidate;
 }
 
-function handlePackCreation(array $post, array $dataset, $exportRoot, array $allowedSides, array $allowedClassifications, array &$exportHistory, $exportHistoryPath)
+function handlePackCreation(PDO $pdo, array $post, $datasetRoot, $exportRoot, array $allowedSides, array $allowedClassifications)
 {
     $errors = [];
     $messages = [];
@@ -1200,10 +1289,12 @@ function handlePackCreation(array $post, array $dataset, $exportRoot, array $all
         $packName = 'Training pack ' . date('Y-m-d H:i');
     }
 
+    $groupedBucketCount = countGroupedBuckets($pdo, $exportSide);
+
     if ($groupedSamplesPerCluster === false || $groupedSamplesPerCluster === null) {
         $errors[] = 'Enter a valid grouped-items-per-folder value.';
     } else {
-        $minimumPackSize = countGroupedBuckets($dataset, $exportSide) * $groupedSamplesPerCluster;
+        $minimumPackSize = $groupedBucketCount * $groupedSamplesPerCluster;
     }
 
     if ($packSize === false || $packSize === null) {
@@ -1218,7 +1309,7 @@ function handlePackCreation(array $post, array $dataset, $exportRoot, array $all
         $errors[] = 'Train, val, and test ratios must add up to 100.';
     }
 
-    $pools = buildExportPools($dataset, $allowedClassifications, $exportSide);
+    $pools = buildExportPools($pdo, $allowedClassifications, $exportSide);
     $availableImageCount = 0;
     $minimumByClassification = [];
 
@@ -1229,8 +1320,8 @@ function handlePackCreation(array $post, array $dataset, $exportRoot, array $all
 
         if ($groupedSamplesPerCluster !== false && $groupedSamplesPerCluster !== null) {
             foreach ($pools[$classification]['grouped_buckets'] as $bucket) {
-                if (count($bucket['items']) < $groupedSamplesPerCluster) {
-                    $insufficientGroupedBuckets[] = $bucket['key'] . ' (' . count($bucket['items']) . ' available)';
+                if ($bucket['count'] < $groupedSamplesPerCluster) {
+                    $insufficientGroupedBuckets[] = $bucket['key'] . ' (' . $bucket['count'] . ' available)';
                 }
             }
         }
@@ -1260,7 +1351,7 @@ function handlePackCreation(array $post, array $dataset, $exportRoot, array $all
     $selectedItems = [];
 
     foreach ($allowedClassifications as $classification) {
-        $selection = selectImagesForClassification($pools[$classification], $classTargets[$classification], (int) $groupedSamplesPerCluster);
+        $selection = selectImagesForClassification($pdo, $exportSide, $classification, $pools[$classification], $classTargets[$classification], (int) $groupedSamplesPerCluster);
 
         if (count($selection) < $classTargets[$classification]) {
             $errors[] = 'Not enough ' . $classification . ' images are available on the ' . $exportSide . ' side to build the requested pack.';
@@ -1301,6 +1392,8 @@ function handlePackCreation(array $post, array $dataset, $exportRoot, array $all
             return ['errors' => $errors, 'messages' => $messages, 'pack' => $pack];
         }
 
+        $sourcePath = $datasetRoot . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $item['relative_path']);
+
         $targetName = buildUniqueFileName(
             $targetDirectory,
             sanitizeFileBase($item['side'] . '__' . $item['cluster'] . '__' . pathinfo($item['filename'], PATHINFO_FILENAME)),
@@ -1308,14 +1401,14 @@ function handlePackCreation(array $post, array $dataset, $exportRoot, array $all
         );
         $targetPath = $targetDirectory . DIRECTORY_SEPARATOR . $targetName;
 
-        if (!copy($item['absolute_path'], $targetPath)) {
+        if (!copy($sourcePath, $targetPath)) {
             $errors[] = 'Unable to copy ' . $item['relative_path'] . ' into the export pack.';
             return ['errors' => $errors, 'messages' => $messages, 'pack' => $pack];
         }
 
         $classificationCounts[$item['classification']]++;
         $manifestRows[] = [
-            $item['relative_path'],
+            relativeProjectPath($sourcePath),
             relativeProjectPath($targetPath),
             $split,
             $item['classification'],
@@ -1350,6 +1443,9 @@ function handlePackCreation(array $post, array $dataset, $exportRoot, array $all
         'split_counts' => $splitCounts,
         'classification_counts' => $classificationCounts,
         'grouped_samples_per_cluster' => (int) $groupedSamplesPerCluster,
+        'train_ratio' => $trainRatio,
+        'val_ratio' => $valRatio,
+        'test_ratio' => $testRatio,
         'class_targets' => $classTargets,
         'manifest_relative_path' => relativeProjectPath($manifestPath),
         'manifest_web_path' => toWebPath(relativeProjectPath($manifestPath)),
@@ -1363,11 +1459,7 @@ function handlePackCreation(array $post, array $dataset, $exportRoot, array $all
         return ['errors' => $errors, 'messages' => $messages, 'pack' => null];
     }
 
-    $exportHistory = mergeExportHistory([$pack], $exportHistory);
-
-    if (!saveJsonFile($exportHistoryPath, array_values($exportHistory), $errors, 'export history')) {
-        return ['errors' => $errors, 'messages' => $messages, 'pack' => null];
-    }
+    insertExportPack($pdo, $pack);
 
     $messages[] = 'Created ' . $exportSide . '-side export pack ' . $packName . ' with ' . count($selectedItems) . ' images.';
     return ['errors' => $errors, 'messages' => $messages, 'pack' => $pack];
@@ -1379,67 +1471,77 @@ function parsePercentage($value)
     return $parsed === false ? null : $parsed;
 }
 
-function countGroupedBuckets(array $dataset, $side = null)
+function countGroupedBuckets(PDO $pdo, $side = null)
 {
-    $count = 0;
+    $sql = "SELECT COUNT(*) FROM (SELECT 1 FROM images WHERE cluster != 'ungroupable'";
+    $params = [];
 
-    foreach ($dataset['clusters'] as $cluster) {
-        if ($side !== null && $side !== '' && $cluster['side'] !== $side) {
-            continue;
-        }
-
-        if ($cluster['cluster'] !== 'ungroupable') {
-            $count++;
-        }
+    if ($side !== null && $side !== '') {
+        $sql .= ' AND side = :side';
+        $params['side'] = $side;
     }
 
-    return $count;
+    $sql .= ' GROUP BY side, classification, cluster) AS grouped_buckets';
+
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute($params);
+
+    return (int) $stmt->fetchColumn();
 }
 
-function buildExportPools(array $dataset, array $allowedClassifications, $side = null)
+/**
+ * Builds per-classification pools with grouped-bucket counts (not full image
+ * lists) plus ungroupable/total counts, used for pack-size validation and
+ * quota allocation. Actual image rows are only fetched later in
+ * selectImagesForClassification via targeted, LIMITed queries.
+ */
+function buildExportPools(PDO $pdo, array $allowedClassifications, $side = null)
 {
     $pools = [];
 
     foreach ($allowedClassifications as $classification) {
         $pools[$classification] = [
             'grouped_buckets' => [],
-            'ungroupable_items' => [],
-            'leftover_grouped_items' => [],
             'grouped_bucket_count' => 0,
+            'ungroupable_count' => 0,
             'total_available' => 0,
         ];
     }
 
-    foreach ($dataset['clusters'] as $cluster) {
-        if ($side !== null && $side !== '' && $cluster['side'] !== $side) {
+    $sql = 'SELECT side, classification, cluster, COUNT(*) AS image_count FROM images';
+    $params = [];
+
+    if ($side !== null && $side !== '') {
+        $sql .= ' WHERE side = :side';
+        $params['side'] = $side;
+    }
+
+    $sql .= ' GROUP BY side, classification, cluster';
+
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute($params);
+
+    foreach ($stmt as $row) {
+        $classification = $row['classification'];
+
+        if (!isset($pools[$classification])) {
             continue;
         }
 
-        $classification = $cluster['classification'];
-        $bucketItems = [];
+        $count = (int) $row['image_count'];
+        $pools[$classification]['total_available'] += $count;
 
-        foreach ($cluster['images'] as $image) {
-            $bucketItems[] = [
-                'filename' => $image['filename'],
-                'absolute_path' => $image['absolute_path'],
-                'relative_path' => $image['relative_path'],
-                'side' => $cluster['side'],
-                'classification' => $classification,
-                'cluster' => $cluster['cluster'],
-            ];
-        }
-
-        $pools[$classification]['total_available'] += count($bucketItems);
-
-        if ($cluster['cluster'] === 'ungroupable') {
-            $pools[$classification]['ungroupable_items'] = array_merge($pools[$classification]['ungroupable_items'], $bucketItems);
+        if ($row['cluster'] === 'ungroupable') {
+            $pools[$classification]['ungroupable_count'] += $count;
             continue;
         }
 
         $pools[$classification]['grouped_bucket_count']++;
         $pools[$classification]['grouped_buckets'][] = [
-            'key' => $cluster['key'],
-            'items' => $bucketItems,
+            'key' => $row['side'] . '/' . $row['classification'] . '/' . $row['cluster'],
+            'side' => $row['side'],
+            'cluster' => $row['cluster'],
+            'count' => $count,
         ];
     }
 
@@ -1478,55 +1580,186 @@ function allocateClassificationTargets($packSize, array $minimumByClassification
     return $targets;
 }
 
-function selectImagesForClassification(array $pool, $targetCount, $groupedSamplesPerCluster)
+/**
+ * Row count above which ORDER BY RAND() LIMIT N is considered too expensive
+ * (it forces MySQL to score and sort every matching row). Buckets at or
+ * above this size are sampled via random id offsets instead, which only
+ * touches the indexed id column and stays cheap regardless of table size.
+ */
+const RANDOM_SORT_ROW_THRESHOLD = 5000;
+
+/**
+ * Samples up to $limit image rows matching the given WHERE clause, avoiding
+ * ORDER BY RAND() on large result sets. Strategy:
+ *  - If the matching set is small (<= RANDOM_SORT_ROW_THRESHOLD), a plain
+ *    ORDER BY RAND() LIMIT is simplest and fast enough.
+ *  - Otherwise, fetch just the matching ids (a cheap, fully index-covered
+ *    scan since (side, classification, cluster) is indexed and InnoDB
+ *    secondary indexes implicitly carry the primary key), pick random ids in
+ *    PHP, then fetch those specific rows in one `WHERE id IN (...)` lookup.
+ *    This avoids both sorting the full row set and the O(offset) rescans
+ *    that a naive LIMIT/OFFSET approach would incur, so it stays fast even
+ *    well past 50k+ rows (e.g. a large ungroupable bucket).
+ *
+ * $whereSql must reference only :side/:classification/:cluster-style named
+ * params supplied via $params; an optional list of already-used ids can be
+ * excluded via $excludeIds.
+ */
+function sampleRandomImageRows(PDO $pdo, $whereSql, array $params, $limit, array $excludeIds = [])
+{
+    $limit = (int) $limit;
+
+    if ($limit <= 0) {
+        return [];
+    }
+
+    $excludeSql = empty($excludeIds) ? '' : (' AND id NOT IN (' . implode(',', array_map('intval', $excludeIds)) . ')');
+    $fullWhere = $whereSql . $excludeSql;
+
+    $countStmt = $pdo->prepare('SELECT COUNT(*) FROM images WHERE ' . $fullWhere);
+    $countStmt->execute($params);
+    $total = (int) $countStmt->fetchColumn();
+
+    if ($total <= 0) {
+        return [];
+    }
+
+    // If we need everything (or more than exists), just take it all in bulk.
+    if ($limit >= $total) {
+        $stmt = $pdo->prepare(
+            'SELECT id, filename, relative_path, side, classification, cluster FROM images '
+            . 'WHERE ' . $fullWhere . ' ORDER BY id LIMIT :limit'
+        );
+        foreach ($params as $key => $value) {
+            $stmt->bindValue($key, $value);
+        }
+        $stmt->bindValue('limit', $total, PDO::PARAM_INT);
+        $stmt->execute();
+
+        return $stmt->fetchAll(PDO::FETCH_ASSOC);
+    }
+
+    if ($total <= RANDOM_SORT_ROW_THRESHOLD) {
+        $stmt = $pdo->prepare(
+            'SELECT id, filename, relative_path, side, classification, cluster FROM images '
+            . 'WHERE ' . $fullWhere . ' ORDER BY RAND() LIMIT :limit'
+        );
+        foreach ($params as $key => $value) {
+            $stmt->bindValue($key, $value);
+        }
+        $stmt->bindValue('limit', $limit, PDO::PARAM_INT);
+        $stmt->execute();
+
+        return $stmt->fetchAll(PDO::FETCH_ASSOC);
+    }
+
+    // Large bucket: fetch only the matching ids (covered by the index on
+    // side/classification/cluster, so no full row/table scan is needed),
+    // sample randomly in PHP, then fetch the chosen rows by primary key.
+    $idStmt = $pdo->prepare('SELECT id FROM images WHERE ' . $fullWhere);
+    $idStmt->execute($params);
+    $ids = $idStmt->fetchAll(PDO::FETCH_COLUMN, 0);
+
+    if (empty($ids)) {
+        return [];
+    }
+
+    $sampleCount = min($limit, count($ids));
+    $chosenKeys = array_rand($ids, $sampleCount);
+
+    if (!is_array($chosenKeys)) {
+        $chosenKeys = [$chosenKeys];
+    }
+
+    $chosenIds = [];
+    foreach ($chosenKeys as $key) {
+        $chosenIds[] = (int) $ids[$key];
+    }
+
+    $placeholders = implode(',', array_fill(0, count($chosenIds), '?'));
+    $rowStmt = $pdo->prepare(
+        'SELECT id, filename, relative_path, side, classification, cluster FROM images '
+        . 'WHERE id IN (' . $placeholders . ')'
+    );
+    $rowStmt->execute($chosenIds);
+
+    return $rowStmt->fetchAll(PDO::FETCH_ASSOC);
+}
+
+/**
+ * Selects images for one classification directly via SQL: takes
+ * groupedSamplesPerCluster from every grouped bucket first, then fills from
+ * ungroupable, then from any grouped leftovers. All sampling is delegated to
+ * sampleRandomImageRows(), which switches from ORDER BY RAND() to random-
+ * offset sampling once a bucket grows past RANDOM_SORT_ROW_THRESHOLD rows
+ * (e.g. large ungroupable buckets), avoiding a full-table sort in that case.
+ */
+function selectImagesForClassification(PDO $pdo, $side, $classification, array $pool, $targetCount, $groupedSamplesPerCluster)
 {
     $selected = [];
-    $groupedBuckets = $pool['grouped_buckets'];
-    $ungroupableItems = $pool['ungroupable_items'];
+    $usedIds = [];
 
+    $groupedBuckets = $pool['grouped_buckets'];
     shuffle($groupedBuckets);
 
-    foreach ($groupedBuckets as &$bucket) {
-        shuffle($bucket['items']);
+    foreach ($groupedBuckets as $bucket) {
+        if (count($selected) >= $targetCount) {
+            break;
+        }
 
-        if (empty($bucket['items'])) {
+        $mustTake = min((int) $groupedSamplesPerCluster, $bucket['count']);
+
+        if ($mustTake <= 0) {
             continue;
         }
 
-        $mustTake = min((int) $groupedSamplesPerCluster, count($bucket['items']));
+        $rows = sampleRandomImageRows(
+            $pdo,
+            'side = :side AND classification = :classification AND cluster = :cluster',
+            ['side' => $side, 'classification' => $classification, 'cluster' => $bucket['cluster']],
+            $mustTake,
+            array_keys($usedIds)
+        );
 
-        for ($takeIndex = 0; $takeIndex < $mustTake; $takeIndex++) {
-            $selected[] = array_shift($bucket['items']);
+        foreach ($rows as $row) {
+            $selected[] = $row;
+            $usedIds[$row['id']] = true;
 
             if (count($selected) === $targetCount) {
                 return $selected;
             }
         }
     }
-    unset($bucket);
 
-    shuffle($ungroupableItems);
+    if (count($selected) < $targetCount) {
+        $remaining = $targetCount - count($selected);
+        $rows = sampleRandomImageRows(
+            $pdo,
+            "side = :side AND classification = :classification AND cluster = 'ungroupable'",
+            ['side' => $side, 'classification' => $classification],
+            $remaining,
+            array_keys($usedIds)
+        );
 
-    while (!empty($ungroupableItems) && count($selected) < $targetCount) {
-        $selected[] = array_shift($ungroupableItems);
-    }
-
-    if (count($selected) === $targetCount) {
-        return $selected;
-    }
-
-    $leftovers = [];
-
-    foreach ($groupedBuckets as $bucket) {
-        foreach ($bucket['items'] as $item) {
-            $leftovers[] = $item;
+        foreach ($rows as $row) {
+            $selected[] = $row;
+            $usedIds[$row['id']] = true;
         }
     }
 
-    shuffle($leftovers);
+    if (count($selected) < $targetCount) {
+        $remaining = $targetCount - count($selected);
+        $rows = sampleRandomImageRows(
+            $pdo,
+            "side = :side AND classification = :classification AND cluster != 'ungroupable'",
+            ['side' => $side, 'classification' => $classification],
+            $remaining,
+            array_keys($usedIds)
+        );
 
-    while (!empty($leftovers) && count($selected) < $targetCount) {
-        $selected[] = array_shift($leftovers);
+        foreach ($rows as $row) {
+            $selected[] = $row;
+        }
     }
 
     return $selected;
@@ -1556,7 +1789,7 @@ function allocateSplitCounts($total, array $ratios)
     return $counts;
 }
 
-function handleResultSave(array $post, array $availablePackMap, array $existingResults, $resultHistoryPath)
+function handleResultSave(PDO $pdo, array $post, array $availablePackMap)
 {
     $errors = [];
     $messages = [];
@@ -1583,7 +1816,7 @@ function handleResultSave(array $post, array $availablePackMap, array $existingR
     }
 
     if (!empty($errors)) {
-        return ['errors' => $errors, 'messages' => $messages, 'result' => $result, 'results' => $existingResults];
+        return ['errors' => $errors, 'messages' => $messages, 'result' => $result];
     }
 
     $pack = $availablePackMap[$packId];
@@ -1602,14 +1835,33 @@ function handleResultSave(array $post, array $availablePackMap, array $existingR
         'pack_size' => isset($pack['pack_size']) ? (int) $pack['pack_size'] : 0,
     ];
 
-    array_unshift($existingResults, $result);
+    $stmt = $pdo->prepare(
+        'INSERT INTO training_results ('
+        . 'id, pack_id, pack_name, pack_side, pack_size, accuracy, precision_value, recall_value, '
+        . 'false_positives, false_negatives, notes, created_at'
+        . ') VALUES ('
+        . ':id, :pack_id, :pack_name, :pack_side, :pack_size, :accuracy, :precision_value, :recall_value, '
+        . ':false_positives, :false_negatives, :notes, :created_at'
+        . ')'
+    );
 
-    if (!saveJsonFile($resultHistoryPath, array_values($existingResults), $errors, 'training results')) {
-        return ['errors' => $errors, 'messages' => $messages, 'result' => null, 'results' => $existingResults];
-    }
+    $stmt->execute([
+        'id' => $result['id'],
+        'pack_id' => $result['pack_id'],
+        'pack_name' => $result['pack_name'],
+        'pack_side' => $result['pack_side'],
+        'pack_size' => $result['pack_size'],
+        'accuracy' => $result['accuracy'],
+        'precision_value' => $result['precision'],
+        'recall_value' => $result['recall'],
+        'false_positives' => $result['false_positives'],
+        'false_negatives' => $result['false_negatives'],
+        'notes' => $result['notes'],
+        'created_at' => date('Y-m-d H:i:s'),
+    ]);
 
     $messages[] = 'Saved training result for ' . $pack['pack_name'] . '.';
-    return ['errors' => $errors, 'messages' => $messages, 'result' => $result, 'results' => $existingResults];
+    return ['errors' => $errors, 'messages' => $messages, 'result' => $result];
 }
 
 function parseDecimalPercentage($value)
@@ -1631,30 +1883,35 @@ function parseDecimalPercentage($value)
     return $number;
 }
 
-function buildRecommendation(array $dataset, array $exportHistory, array $trainingResults, array $allowedClassifications, $side = null)
+function buildRecommendation(PDO $pdo, array $allowedClassifications, $side = null)
 {
     $groupedSamplesPerCluster = 1;
-    $minimumPackSize = countGroupedBuckets($dataset, $side) * $groupedSamplesPerCluster;
-    $ungroupableImages = countUngroupableImages($dataset, $side);
+    $minimumPackSize = countGroupedBuckets($pdo, $side) * $groupedSamplesPerCluster;
+    $ungroupableImages = countUngroupableImages($pdo, $side);
     $basePackSize = $minimumPackSize + min($ungroupableImages, max(4, (int) ceil($minimumPackSize * 0.5)));
-    $classificationMinimums = buildClassificationMinimums($dataset, $allowedClassifications, $side);
+    $classificationMinimums = buildClassificationMinimums($pdo, $allowedClassifications, $side);
     foreach ($classificationMinimums as $classification => $minimum) {
         $classificationMinimums[$classification] = $minimum * $groupedSamplesPerCluster;
     }
-    $classTargets = allocateClassificationTargets(max($minimumPackSize, $basePackSize), $classificationMinimums, buildExportPools($dataset, $allowedClassifications, $side));
+    $classTargets = allocateClassificationTargets(max($minimumPackSize, $basePackSize), $classificationMinimums, buildExportPools($pdo, $allowedClassifications, $side));
     $notes = [
         'Use the same grouped-items-per-folder value across every grouped folder.',
         'Use ungroupable images as the first fill source to improve generalization after cluster coverage is met.',
     ];
 
     $latestResult = null;
-    foreach ($trainingResults as $result) {
-        if ($side !== null && $side !== '' && isset($result['pack_side']) && $result['pack_side'] !== $side) {
-            continue;
-        }
+    $stmt = $pdo->prepare('SELECT * FROM training_results WHERE (:side IS NULL OR :side2 = \'\' OR pack_side = :side3) ORDER BY created_at DESC LIMIT 1');
+    $stmt->execute(['side' => $side, 'side2' => (string) $side, 'side3' => (string) $side]);
+    $latestResultRow = $stmt->fetch();
 
-        $latestResult = $result;
-        break;
+    if ($latestResultRow !== false) {
+        $latestResult = [
+            'recall' => (float) $latestResultRow['recall_value'],
+            'precision' => (float) $latestResultRow['precision_value'],
+            'false_negatives' => (int) $latestResultRow['false_negatives'],
+            'false_positives' => (int) $latestResultRow['false_positives'],
+            'pack_size' => (int) $latestResultRow['pack_size'],
+        ];
     }
 
     $packSize = max($minimumPackSize, $basePackSize);
@@ -1681,9 +1938,9 @@ function buildRecommendation(array $dataset, array $exportHistory, array $traini
         $notes[] = 'No prior results yet, so the starting recommendation is based on complete cluster coverage plus ungroupable fill.';
     }
 
-    $packSize = min(countImagesForSide($dataset, $side), $packSize);
-    $poolData = buildExportPools($dataset, $allowedClassifications, $side);
-    $classificationMinimums = buildClassificationMinimums($dataset, $allowedClassifications, $side);
+    $packSize = min(countImagesForSide($pdo, $side), $packSize);
+    $poolData = buildExportPools($pdo, $allowedClassifications, $side);
+    $classificationMinimums = buildClassificationMinimums($pdo, $allowedClassifications, $side);
     foreach ($classificationMinimums as $classification => $minimum) {
         $classificationMinimums[$classification] = $minimum * $groupedSamplesPerCluster;
     }
@@ -1702,7 +1959,7 @@ function buildRecommendation(array $dataset, array $exportHistory, array $traini
     ];
 }
 
-function buildClassificationMinimums(array $dataset, array $allowedClassifications, $side = null)
+function buildClassificationMinimums(PDO $pdo, array $allowedClassifications, $side = null)
 {
     $minimums = [];
 
@@ -1710,58 +1967,60 @@ function buildClassificationMinimums(array $dataset, array $allowedClassificatio
         $minimums[$classification] = 0;
     }
 
-    foreach ($dataset['clusters'] as $cluster) {
-        if ($side !== null && $side !== '' && $cluster['side'] !== $side) {
-            continue;
-        }
+    $sql = "SELECT classification, COUNT(*) AS bucket_count FROM (SELECT classification, side, cluster FROM images WHERE cluster != 'ungroupable'";
+    $params = [];
 
-        if ($cluster['cluster'] === 'ungroupable') {
-            continue;
-        }
+    if ($side !== null && $side !== '') {
+        $sql .= ' AND side = :side';
+        $params['side'] = $side;
+    }
 
-        $minimums[$cluster['classification']]++;
+    $sql .= ' GROUP BY side, classification, cluster) AS buckets GROUP BY classification';
+
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute($params);
+
+    foreach ($stmt as $row) {
+        if (isset($minimums[$row['classification']])) {
+            $minimums[$row['classification']] = (int) $row['bucket_count'];
+        }
     }
 
     return $minimums;
 }
 
-function countUngroupableImages(array $dataset, $side = null)
+function countUngroupableImages(PDO $pdo, $side = null)
 {
-    $count = 0;
+    $sql = "SELECT COUNT(*) FROM images WHERE cluster = 'ungroupable'";
+    $params = [];
 
-    foreach ($dataset['clusters'] as $cluster) {
-        if ($side !== null && $side !== '' && $cluster['side'] !== $side) {
-            continue;
-        }
-
-        if ($cluster['cluster'] !== 'ungroupable') {
-            continue;
-        }
-
-        $count += (int) $cluster['count'];
+    if ($side !== null && $side !== '') {
+        $sql .= ' AND side = :side';
+        $params['side'] = $side;
     }
 
-    return $count;
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute($params);
+
+    return (int) $stmt->fetchColumn();
 }
 
-function countImagesForSide(array $dataset, $side = null)
+function countImagesForSide(PDO $pdo, $side = null)
 {
-    if ($side === null || $side === '') {
-        return (int) $dataset['stats']['total_images'];
+    $sql = 'SELECT COUNT(*) FROM images';
+    $params = [];
+
+    if ($side !== null && $side !== '') {
+        $sql .= ' WHERE side = :side';
+        $params['side'] = $side;
     }
 
-    $count = 0;
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute($params);
 
-    foreach ($dataset['clusters'] as $cluster) {
-        if ($cluster['side'] !== $side) {
-            continue;
-        }
-
-        $count += (int) $cluster['count'];
-    }
-
-    return $count;
+    return (int) $stmt->fetchColumn();
 }
+
 
 function stickyPostValue($key, $default)
 {
